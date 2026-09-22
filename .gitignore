@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# TARS local state -- contains the Gemini API key and personal memory facts.
+# Never commit these.
+.tars_config.json
+.tars_memory.json
+.env
+
+# Generated output
+mission_logs/
+scratch/_*.txt
+scratch/chart.png
