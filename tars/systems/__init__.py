@@ -6,8 +6,10 @@ from tars.systems.chat import process_chat
 from tars.systems.research import run_deep_research
 from tars.systems.goals import run_autonomous_goal
 from tars.systems.hive import run_case_task, run_kipp_research, run_hive_mission
+from tars.systems.sentinel import sentinel
 
 __all__ = [
+    "sentinel",
     "run_docking_simulation",
     "calculate_time_dilation",
     "calculate_schwarzschild_dilation",

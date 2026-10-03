@@ -22,6 +22,15 @@ class TarsState:
         self.boot_time: float = time.time()
         self.commands_processed: int = 0
 
+        # ─── Affective telemetry ────────────────────────────────────────────
+        # Written by tars.core.emotion on every operator turn, read by the HUD.
+        # Kept here rather than inside the engine so the UI does not have to
+        # import the affective core to draw a status line.
+        self.operator_mood: str = "neutral"
+        self.mood_intensity: float = 0.0
+        self.mood_reason: str = ""
+        self.mood_subject: str = ""
+
     @property
     def uptime_str(self) -> str:
         seconds = int(time.time() - self.boot_time)

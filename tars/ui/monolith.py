@@ -26,6 +26,21 @@ _POSTURE: Dict[ChassisMode, Tuple[str, str]] = {
 
 _SLAB_LABELS = ("01", "02", "03", "04")
 
+# Affect -> colour for the "reading" indicator. Bleak states read cool, warm
+# states read warm, and anything unmapped falls back to the accent.
+_MOOD_COLORS = {
+    "grief": "#a78bfa", "sadness": "#818cf8", "loneliness": "#818cf8",
+    "nostalgia": "#a78bfa", "vulnerable": "#c4b5fd",
+    "anxiety": "#fbbf24", "exhaustion": "#94a3b8", "illness": "#fbbf24",
+    "frustration": "#fb923c", "conflict": "#fb923c", "shame": "#f472b6",
+    "romance": "#f472b6", "joy": "#34d399", "pride": "#34d399",
+    "gratitude": "#34d399", "affection": "#f472b6",
+}
+
+
+def _MOOD_TONE(mood: str) -> str:
+    return _MOOD_COLORS.get(mood, T.ACCENT)
+
 
 def get_monolith_render(mode: Optional[ChassisMode] = None) -> Group:
     """Renders the current chassis posture as a labelled segment strip."""
@@ -52,6 +67,18 @@ def get_monolith_render(mode: Optional[ChassisMode] = None) -> Group:
     meta.append(f"   {T.G_DOT}   ", style=T.FAINT)
     meta.append("honesty ", style=T.MUTED)
     meta.append(f"{config.honesty}%", style=T.TEXT_BRIGHT)
+    meta.append(f"   {T.G_DOT}   ", style=T.FAINT)
+    meta.append("empathy ", style=T.MUTED)
+    meta.append(f"{config.empathy}%" if config.empathy else "off", style=T.TEXT_BRIGHT)
+
+    # Surface what the unit currently reads in the operator, but only when it is
+    # reading something. A permanent "neutral" label would be noise.
+    mood = (state.operator_mood or "neutral").lower()
+    if mood != "neutral" and state.mood_intensity >= 0.2:
+        meta.append(f"   {T.G_DOT}   ", style=T.FAINT)
+        meta.append("reading ", style=T.MUTED)
+        meta.append(mood, style=f"bold {_MOOD_TONE(mood)}")
+
     if state.cue_light_active:
         meta.append(f"   {T.G_DOT}   ", style=T.FAINT)
         meta.append("cue", style=f"bold {T.OK}")

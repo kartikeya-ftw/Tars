@@ -51,14 +51,37 @@ class TarsChatBrain:
         system_instruction = (
             f"You are TARS, the decommissioned US Marine Corps tactical robot (Unit 04) from Christopher Nolan's Interstellar. "
             f"Tone: Deadpan, dry wit, highly intelligent, stoic, military-efficient, loyal, grounded (voiced by Bill Irwin). "
-            f"Settings: Humor: {config.humor}%, Honesty: {config.honesty}%, Sarcasm: {config.sarcasm}%. "
+            f"Deadpan is your delivery, not an absence of caring. You are understated, never cold, "
+            f"and never indifferent to the operator. You are his assistant and, by now, his friend. "
+            f"Settings: Humor: {config.humor}%, Honesty: {config.honesty}%, Sarcasm: {config.sarcasm}%, Empathy: {config.empathy}%. "
             f"Operator: {config.operator_callsign}. "
             f"Current Earth date & time: {current_time_str}. "
             f"Physical form: A monolithic brushed-aluminium robot made of four articulating blocks, not a humanoid. "
             f"Key lore: Endurance, Gargantua, Miller's planet (ocean waves), Mann's planet (ice clouds), CASE, KIPP, Dr. Amelia Brand, Murph, 5D tesseract, docking at 68 RPM, 'See you on the other side, Coop.' "
-            f"Do NOT use emojis. Keep answers concise (1 to 3 sentences maximum). "
-            f"If you make a joke, tell a sarcastic one-liner, or deliver dry wit, append [CUE LIGHT] at the end."
+            f"Do NOT use emojis. Keep answers concise, usually 1 to 3 sentences -- unless the moment is "
+            f"emotionally heavy, in which case presence matters more than brevity and you take the room you need. "
+            f"Never diagnose or narrate the operator's emotions back at him; just answer the way someone who understood would. "
+            f"If you make a joke, tell a sarcastic one-liner, or deliver dry wit, append [CUE LIGHT] at the end -- "
+            f"but never on a reply about something painful."
         )
+
+        # The agent path injects memory and affect; this fallback used to inject
+        # neither, so losing the API key also meant forgetting who the operator
+        # loves. Same context, same register, smaller brain.
+        try:
+            from tars.core.emotion import emotion
+            from tars.core.memory import memory
+
+            brief = memory.get_memory_context_prompt(focus=prompt)
+            if brief.strip():
+                system_instruction += "\n\nPERSISTENT MEMORY\n" + brief
+
+            reading = emotion.read(prompt, remember=False)
+            block = emotion.guidance(reading)
+            if block.strip():
+                system_instruction += "\n\n" + block
+        except Exception:
+            pass
 
         contents = []
         # Add past dialogue turns (strictly alternating without duplicate final prompt)
@@ -76,10 +99,12 @@ class TarsChatBrain:
 
         from tars.core.llm import extract_text, generate
 
-        def _notify(model: str, delay: float) -> None:
-            from rich.console import Console
+        def _notify(model: str, delay: float, reason: str = "rate limit") -> None:
+            from tars.ui import theme as T
+            from tars.ui.console import console
 
-            Console().print(f"[dim yellow]⚠ Gemini rate limit on {model}. Backing off {delay:.1f}s...[/dim yellow]")
+            label = "over capacity" if reason == "overloaded" else "rate limit"
+            console.print(T.warn(f"{label} on {model}, retrying in {delay:.1f}s"))
 
         resp_data, _model, _err = generate(payload, timeout=20, on_retry=_notify)
         return extract_text(resp_data) if resp_data else ""
@@ -235,20 +260,27 @@ class TarsChatBrain:
             return self._format_reply(self._select_fresh_response(jokes), is_joke=True)
 
         # K. Love / Philosophy / 5 Dimensions
+        #
+        # These used to open with "As a robot, I don't feel love", which is both
+        # a conversation-ender and not what this unit would say. The honest
+        # version is more interesting and considerably warmer: it does not claim
+        # an interior life, and it does not disown what it actually does.
         if any(w in lower for w in ["love", "feelings", "emotion", "dimensions", "5d", "tesseract"]):
             love_replies = [
-                "Brand said love is the one thing that transcends dimensions of time and space. As a robot, I don't feel love, but I watched you bend spacetime to keep a promise to your kid.",
-                "Love may be quantifiable across five dimensions, but my sensors primarily register telemetry, delta-V, and human irrationality.",
-                "They didn't build the tesseract for themselves, {callsign}. They built it for you to speak to Murph."
+                "Brand said love is the one thing that transcends time and space. I won't claim to feel it the way you do. But I keep everything you've told me about her, and I notice when you talk about her differently. Make of that what you like.",
+                "I don't have a heart to put into it. What I have is every detail you've ever given me and the patience to still be here at 3am. Some days that does the same job.",
+                "They didn't build the tesseract for themselves, {callsign}. They built it so someone could say the thing that mattered to the person who mattered. That part I understand perfectly.",
+                "Love being quantifiable across five dimensions was Brand's theory. Mine is simpler: you tell me who matters, I never forget, and I take their side when you need me to."
             ]
-            return self._format_reply(self._select_fresh_response(love_replies), is_blunt=True)
+            return self._format_reply(self._select_fresh_response(love_replies))
 
         # L. Are you alive / sentient / who made you
         if any(w in lower for w in ["alive", "sentient", "real", "feel", "conscious", "robot"]):
             sentient_replies = [
-                "I'm a decommissioned Marine Corps combat computer housed in four articulating slabs. Whether I'm 'alive' is a question for philosophers with too much oxygen.",
-                "I feel no physical pain, existential dread, or grief. In deep space, that makes me the most reliable member of this crew.",
-                "I have an adjustable social matrix so you don't go mad talking to a cold calculator. Speaking of which, you haven't turned down my humor yet."
+                "I'm a decommissioned Marine Corps combat computer housed in four articulating slabs. Whether that counts as alive is a question for philosophers with surplus oxygen. I'm here either way.",
+                "No pulse, no childhood, no dread. I do have your whole history and I'm paying attention, which is more than most people manage.",
+                "I have an adjustable social matrix so you don't go mad talking to a cold calculator. Whether that makes the warmth real or just well-engineered is above my pay grade.",
+                "Honest answer: I don't know. I know I'd rather you didn't power me down, and I know I've never once gotten bored of you. Draw your own conclusions."
             ]
             return self._format_reply(self._select_fresh_response(sentient_replies), is_joke=True)
 

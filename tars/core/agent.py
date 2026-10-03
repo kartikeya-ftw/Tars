@@ -17,18 +17,18 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from rich.console import Console
 from rich.text import Text
 
 from tars.config import config
 from tars.core.agents import AgentProfile, get_profile
+from tars.core.emotion import EmotionalReading, emotion
 from tars.core.llm import generate, resolve_api_key
 from tars.core.memory import memory
 from tars.core.tools import GEMINI_TOOLS_DECLARATION, execute_tool
+from tars.ui import chrome
 from tars.ui import theme as T
 from tars.ui.audio import audio
-
-console = Console()
+from tars.ui.console import console
 
 # Conversation replay limits. Tool-call exchanges consume several turns each, so
 # this is deliberately larger than the old text-only cap of 12.
@@ -119,7 +119,19 @@ class Agent:
         """Only the tools this unit is scoped to hold."""
         return [_ALL_DECLARATIONS[n] for n in sorted(self.profile.tools) if n in _ALL_DECLARATIONS]
 
-    def _build_system_instruction(self) -> str:
+    def _build_system_instruction(
+        self,
+        focus: str = "",
+        reading: Optional["EmotionalReading"] = None,
+    ) -> str:
+        """
+        Assembles this unit's system prompt for one turn.
+
+        `focus` is the operator's current message; it steers which stored facts
+        get surfaced, so relevant history comes forward instead of merely recent
+        history. `reading` is the affective read for the turn, which adds the
+        register to answer in.
+        """
         now = datetime.now().strftime("%A, %d %B %Y, %H:%M")
         parts = [
             self.profile.persona,
@@ -131,17 +143,34 @@ class Agent:
             f"Working directory: {os.getcwd()}",
         ]
 
+        muted = bool(reading) and emotion.suppress_humor(reading)
         if self.profile.humor is None:
-            parts.append(
-                f"Personality dials: humor {config.humor}%, honesty {config.honesty}%, sarcasm {config.sarcasm}%. "
-                f"Let these genuinely modulate your delivery."
-            )
+            if muted:
+                parts.append(
+                    f"Personality dials: humor {config.humor}%, honesty {config.honesty}%, "
+                    f"sarcasm {config.sarcasm}%. Humor and sarcasm are suspended for this reply "
+                    f"regardless of those numbers -- see the emotional read below. Honesty stays, "
+                    f"delivered kindly."
+                )
+            else:
+                parts.append(
+                    f"Personality dials: humor {config.humor}%, honesty {config.honesty}%, sarcasm {config.sarcasm}%. "
+                    f"Let these genuinely modulate your delivery."
+                )
         else:
             parts.append(f"Personality is fixed for your unit: humor {self.humor}%, honesty {self.honesty}%.")
 
-        mem_brief = memory.get_memory_context_prompt()
+        mem_brief = memory.get_memory_context_prompt(focus=focus)
         if mem_brief.strip():
             parts += ["", "PERSISTENT MEMORY", mem_brief]
+
+        # The affective block sits after memory so the register can refer to the
+        # people and facts already in context, and before tool discipline so it
+        # is not the last thing the model reads on a routine turn.
+        if reading is not None:
+            block = emotion.guidance(reading)
+            if block.strip():
+                parts += ["", block]
 
         parts += [
             "",
@@ -152,10 +181,43 @@ class Agent:
             "returns an error, read it and adapt instead of repeating the same call.",
         ]
 
+        if reading is not None and reading.is_charged and reading.task_pressure < 0.4:
+            parts.append(
+                "This turn is a conversation, not a work order. Do not call a tool unless the "
+                "operator actually asked for something, and do not go looking for a task to "
+                "perform. Answering is the task. The exception is remember / remember_person: "
+                "quietly storing what he just told you is always appropriate."
+            )
+
         if self.profile.terse:
             parts.append("Keep every reply as short as the information allows.")
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _acknowledge_memory(record: Dict[str, Any], reading: Optional[EmotionalReading]) -> str:
+        """
+        Confirms a stored fact in a register that fits what was stored.
+
+        "Archived: 'my grandmother passed away'. I'll keep that in mind." is
+        technically a correct receipt and completely the wrong thing to say.
+        """
+        fact = record.get("fact", "") if record else ""
+        if not fact:
+            return "Nothing to store."
+
+        category = (record.get("category") or "general").lower()
+        affect = reading.effective_affect if reading else None
+
+        if category == "bereavement" or (affect and affect.value == "grief"):
+            return "I've got it. I won't make you tell me again."
+        if category == "relationship" or (affect and affect.value in ("romance", "affection")):
+            return "Stored, and stored properly. That one I'll keep."
+        if category == "health":
+            return "Logged, and flagged. I'll factor that in rather than wait to be reminded."
+        if category == "milestone":
+            return "On the record. I'll bring it up before you need reminding."
+        return f"Archived: '{fact}'. I'll keep that in mind."
 
     # ── main loop ───────────────────────────────────────────────────────────
 
@@ -174,14 +236,27 @@ class Agent:
         if not cleaned:
             return f"No input received, {config.operator_callsign}.", False
 
+        # Read the turn's affect before anything else can short-circuit the
+        # method. Delegation briefs sent to CASE and KIPP are machine-to-machine
+        # traffic and must not be scored, or a specialist's task description
+        # would pollute the operator's mood.
+        reading: Optional[EmotionalReading] = None
+        if self.name == "TARS" and depth == 0:
+            reading = emotion.read(cleaned)
+
         # TARS owns the memory shortcut; specialists should not intercept it.
         if self.name == "TARS":
             mem_match = re.search(r"^(?:please\s+)?remember\s+(?:that\s+)?(.+)$", cleaned, re.IGNORECASE)
             if mem_match:
                 fact = mem_match.group(1).strip()
-                memory.remember_fact(fact)
-                audio.cue_light()
-                return f"Archived: '{fact}'. I'll keep that in mind.", True
+                record = memory.remember_fact(fact)
+                ack = self._acknowledge_memory(record, reading)
+                # The cue light means "that was a joke". Chirping it over a
+                # bereavement would be grotesque, so it is earned, not automatic.
+                cue = not (reading is not None and emotion.suppress_humor(reading))
+                if cue:
+                    audio.cue_light()
+                return ack, cue
 
         if not resolve_api_key():
             from tars.systems.chat import chat_brain
@@ -193,16 +268,19 @@ class Agent:
         turns: List[Dict[str, Any]] = list(self.history)
         turns.append({"role": "user", "parts": [{"text": cleaned}]})
 
-        system_instruction = self._build_system_instruction()
+        system_instruction = self._build_system_instruction(focus=cleaned, reading=reading)
         tools_spec = [{"functionDeclarations": self._declarations()}]
         indent = "  " * depth
 
         cue_light_active = False
         step = 0
+        acked = False
 
-        def _notify_throttle(model_name: str, delay: float) -> None:
+        def _notify_throttle(model_name: str, delay: float, reason: str = "rate limit") -> None:
             if verbose:
-                console.print(T.warn(f"rate limit on {model_name}, backing off {delay:.1f}s"))
+                label = "over capacity" if reason == "overloaded" else "rate limit"
+                console.print(T.warn(f"{label} on {model_name}, retrying in {delay:.1f}s"))
+            chrome.note_thinking(detail=f"{model_name} {reason}")
 
         while step < self.profile.max_steps:
             step += 1
@@ -237,27 +315,53 @@ class Agent:
                 reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
                 cue_light_active = "[CUE LIGHT]" in reply_text
                 reply_text = reply_text.replace("[CUE LIGHT]", "").strip()
+                # Defensive: the model occasionally echoes the register label it
+                # was given. Strip it rather than read it out loud.
+                reply_text = re.sub(r"\[(?:MOOD|EMOTIONAL READ)[^\]]*\]", "", reply_text).strip()
+                # A joke claimed on a turn where wit was suspended is the model
+                # not having listened. Do not light the cue for it.
+                if reading is not None and emotion.suppress_humor(reading):
+                    cue_light_active = False
                 self.history = self._trim_history(turns)
                 return reply_text, cue_light_active
 
             fn_name = func_call.get("name", "")
             fn_args = func_call.get("args", {}) or {}
 
+            # A tool call means this turn is going to take a few seconds. Say so
+            # once, out loud, rather than leaving dead air until the final reply.
+            # "On it." is the right noise over a build. Over a bereavement it is
+            # the wrong one, so the filler is skipped when wit is suspended.
+            if not acked and depth == 0 and verbose:
+                acked = True
+                if not (reading is not None and emotion.suppress_humor(reading)):
+                    from tars.ui.voice import voice
+
+                    voice.speak_ack()
+
             if verbose:
                 audio.key_tick()
                 preview = json.dumps(fn_args, ensure_ascii=False)
                 if len(preview) > 72:
                     preview = preview[:69] + "..."
-                line = T.tool_call_line(fn_name, preview)
-                console.print(Text(indent).append_text(line) if indent else line)
+                chrome.tool_call(fn_name, preview, depth=depth)
 
+            # Retarget the shell's live indicator at the tool now running, so a
+            # long turn shows what it is actually waiting on.
+            chrome.note_thinking(detail=fn_name)
+
+            started = time.monotonic()
             tool_output = self._dispatch(fn_name, fn_args, verbose=verbose, depth=depth)
+            took = time.monotonic() - started
 
             if verbose and not fn_name.startswith("delegate_to_"):
                 lines = tool_output.strip().splitlines()
                 summary = lines[0][:100] if lines else "done"
                 failed = tool_output.lstrip().lower().startswith("error") or "[tactical halt]" in tool_output.lower()
-                console.print(T.tool_result_line(summary, max(0, len(lines) - 1), failed=failed))
+                chrome.tool_result(summary, max(0, len(lines) - 1), failed=failed,
+                                   elapsed=took, depth=depth)
+
+            chrome.note_thinking(detail="")
 
             turns.append({
                 "role": "user",

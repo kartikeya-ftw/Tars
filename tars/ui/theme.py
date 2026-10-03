@@ -249,3 +249,235 @@ def ok(text: str) -> Text:
 
 def info(text: str) -> Text:
     return Text.assemble(("  ", ""), (G_DOT, MUTED), ("  ", ""), (text, MUTED))
+
+# ════════════════════════════════════════════════════════════════════════════
+# Instrument layer
+#
+# Everything above is the original restrained type system and still backs every
+# command. What follows adds the pieces that make the shell read as an
+# instrument panel rather than a log file: a gradient ramp, affect tints,
+# segmented meters, badges, and the slab glyph language used by the logo.
+#
+# Design rules, extending the ones at the top of this file:
+#   - Gradients are reserved for identity. Never for data.
+#   - Colour encodes state. Brightness encodes importance. Never swap them.
+#   - Segmented meters, not smooth bars. The chassis is four slabs; the whole
+#     interface speaks in discrete cells.
+# ════════════════════════════════════════════════════════════════════════════
+
+# ─── Extended palette ───────────────────────────────────────────────────────
+# Surfaces, for panel fills and the status bar. Kept very close to a true
+# terminal black so the shell still feels like a terminal.
+BG = "#0b1120"            # slate 950, near-black base
+BG_PANEL = "#111827"      # gray 900, raised surface
+BG_BAR = "#1e293b"        # slate 800, status bar / gutter fill
+BORDER = "#1e293b"        # slate 800, hairline borders
+
+# Identity gradient. Sky to indigo to violet: the TARS accent, warmed through
+# the two specialist colours so the whole roster is implied by the logo.
+RAMP = ("#38bdf8", "#60a5fa", "#818cf8", "#a78bfa")
+# Cool monochrome ramp for data that needs depth without implying state.
+RAMP_COOL = ("#1e293b", "#334155", "#475569", "#64748b", "#94a3b8")
+
+# ─── Slab glyph language ────────────────────────────────────────────────────
+SLAB_FULL = "▮"
+SLAB_EMPTY = "▯"
+SLAB_WIDE = "▰"
+SLAB_WIDE_EMPTY = "▱"
+G_SPARK = "▁▂▃▄▅▆▇█"
+G_CARET = "❯"
+G_HINGE = "┼"
+G_VBAR = "│"
+G_CORNER_TL = "╭"
+G_CORNER_BL = "╰"
+G_WAVE = "∿"
+G_LOCK = "⏻"
+G_SIGNAL = "◈"
+G_EAR = "◉"
+
+# ─── Affect tints ───────────────────────────────────────────────────────────
+# One home for the affect palette, so the HUD, the reply gutter, and the mood
+# readout cannot drift apart. Keys are tars.core.emotion.Affect values.
+MOOD_COLORS = {
+    "grief": "#a78bfa",
+    "sadness": "#818cf8",
+    "loneliness": "#818cf8",
+    "nostalgia": "#a78bfa",
+    "vulnerable": "#c4b5fd",
+    "anxiety": "#fbbf24",
+    "illness": "#fbbf24",
+    "exhaustion": "#94a3b8",
+    "frustration": "#fb923c",
+    "conflict": "#fb923c",
+    "shame": "#f472b6",
+    "romance": "#f472b6",
+    "affection": "#f472b6",
+    "joy": "#34d399",
+    "pride": "#34d399",
+    "gratitude": "#34d399",
+    "neutral": ACCENT,
+}
+
+
+def mood_color(mood: str) -> str:
+    """Colour for an affect name, falling back to the primary accent."""
+    return MOOD_COLORS.get((mood or "neutral").lower(), ACCENT)
+
+
+# ─── Colour maths ───────────────────────────────────────────────────────────
+
+def _hex_to_rgb(value: str):
+    value = value.lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*(max(0, min(255, int(round(c)))) for c in rgb))
+
+
+def mix(a: str, b: str, t: float) -> str:
+    """Linear blend between two hex colours. t=0 returns a, t=1 returns b."""
+    t = max(0.0, min(1.0, t))
+    ra, rb = _hex_to_rgb(a), _hex_to_rgb(b)
+    return _rgb_to_hex(tuple(ra[i] + (rb[i] - ra[i]) * t for i in range(3)))
+
+
+def ramp_at(position: float, stops=RAMP) -> str:
+    """Samples a multi-stop gradient at `position` in 0..1."""
+    if not stops:
+        return ACCENT
+    if len(stops) == 1:
+        return stops[0]
+    position = max(0.0, min(1.0, position))
+    span = position * (len(stops) - 1)
+    index = int(span)
+    if index >= len(stops) - 1:
+        return stops[-1]
+    return mix(stops[index], stops[index + 1], span - index)
+
+
+def gradient_text(content: str, stops=RAMP, bold: bool = False) -> Text:
+    """
+    Colours a string character by character along a gradient.
+
+    Used for identity only -- the logo and the masthead wordmark. Applying this
+    to data would make colour meaningless everywhere else.
+    """
+    out = Text()
+    printable = [i for i, ch in enumerate(content) if ch != " "]
+    if not printable:
+        return Text(content)
+    first, last = printable[0], printable[-1]
+    span = max(1, last - first)
+    for i, ch in enumerate(content):
+        if ch == " ":
+            out.append(" ")
+            continue
+        color = ramp_at((i - first) / span, stops)
+        out.append(ch, style=f"bold {color}" if bold else color)
+    return out
+
+
+def gradient_rule(width: int, stops=RAMP, char: str = "─") -> Text:
+    """A horizontal rule that fades along the identity ramp."""
+    out = Text()
+    width = max(1, width)
+    for i in range(width):
+        out.append(char, style=ramp_at(i / max(1, width - 1), stops))
+    return out
+
+
+# ─── Instrument primitives ──────────────────────────────────────────────────
+
+def meter(fraction: float, width: int = 12, color: Optional[str] = None,
+          warn_at: float = 0.75, crit_at: float = 0.9) -> Text:
+    """
+    Segmented level indicator, in the same slab language as the chassis.
+
+        ▮▮▮▮▮▮▯▯▯▯▯▯
+
+    Colour follows the value unless `color` pins it: green under `warn_at`,
+    amber past it, red past `crit_at`. Data gets semantic colour, never a
+    gradient.
+    """
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(round(fraction * width))
+    if color is None:
+        color = ERR if fraction >= crit_at else (WARN if fraction >= warn_at else OK)
+    out = Text()
+    out.append(SLAB_FULL * filled, style=color)
+    out.append(SLAB_EMPTY * (width - filled), style=FAINT)
+    return out
+
+
+def sparkline(values, color: str = ACCENT) -> Text:
+    """Compact trend strip for a sequence of numbers."""
+    series = [float(v) for v in values if v is not None]
+    if not series:
+        return Text("")
+    low, high = min(series), max(series)
+    span = (high - low) or 1.0
+    out = Text()
+    for v in series:
+        level = int(((v - low) / span) * (len(G_SPARK) - 1))
+        out.append(G_SPARK[level], style=color)
+    return out
+
+
+def badge(content: str, color: str = ACCENT, filled: bool = False) -> Text:
+    """
+    A small inline state tag.
+
+    Filled badges are for live, attention-worthy state (recording, listening,
+    a mood read). Outlined badges are for static labels.
+    """
+    if filled:
+        return Text(f" {content} ", style=f"bold {BG} on {color}")
+    return Text.assemble(("[", FAINT), (content, color), ("]", FAINT))
+
+
+def pill(label_text: str, value_text: str, color: str = ACCENT) -> Text:
+    """Label/value pair for the status bar: muted key, bright value."""
+    return Text.assemble(
+        (label_text, MUTED),
+        (" ", ""),
+        (value_text, f"bold {color}"),
+    )
+
+
+def dim_join(parts, separator: str = f"  {G_DOT}  ") -> Text:
+    """Joins Text fragments with a faint separator."""
+    out = Text()
+    for i, part in enumerate(parts):
+        if i:
+            out.append(separator, style=FAINT)
+        out.append_text(part if isinstance(part, Text) else Text(str(part)))
+    return out
+
+
+def gutter_block(body: RenderableType, color: str = ACCENT, title: str = "",
+                 meta: str = "") -> Table:
+    """
+    Content behind a coloured vertical rule, with an optional title on the rule.
+
+    This is the shell's primary containment device. It gives a reply structure
+    and ownership without the visual weight of a full box, and it survives
+    terminal resizing better than a panel because only one column is fixed.
+
+        │ TARS  · cue
+        │ Your humor setting is currently at 75%.
+    """
+    grid = Table(box=BARE, show_header=False, expand=True, pad_edge=False, padding=0)
+    grid.add_column(width=2, no_wrap=True)
+    grid.add_column(ratio=1, overflow="fold")
+
+    if title:
+        head = Text.assemble((title, f"bold {color}"))
+        if meta:
+            head.append(f"  {G_DOT}  ", style=FAINT)
+            head.append(meta, style=MUTED)
+        grid.add_row(Text(G_VBAR, style=color), head)
+        grid.add_row(Text(G_VBAR, style=FAINT), Text(""))
+
+    grid.add_row(Text(G_VBAR, style=FAINT if title else color), body)
+    return grid

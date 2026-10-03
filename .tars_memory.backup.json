@@ -1,0 +1,103 @@
+{
+  "profile": {
+    "operator_callsign": "Rohit",
+    "os": "Windows (PowerShell)",
+    "primary_workspace": "C:\\Users\\sudha\\OneDrive\\Desktop\\Tars",
+    "custom_instructions": []
+  },
+  "facts": [
+    {
+      "fact": "Operator is testing autonomous TARS agent architecture.",
+      "category": "general",
+      "timestamp": "2026-09-19 16:06:49"
+    },
+    {
+      "fact": "Commander is testing the new memory subsystem.",
+      "category": "general",
+      "timestamp": "2026-09-19 16:09:19"
+    },
+    {
+      "fact": "my girlfriend name is Varsha Priya",
+      "category": "general",
+      "timestamp": "2026-10-02 17:31:56"
+    },
+    {
+      "fact": "my girlfriends birthday is 15th July",
+      "category": "general",
+      "timestamp": "2026-10-02 17:32:53"
+    },
+    {
+      "fact": "Varsha has a toxic trait that makes her be good with people who she had a grudge against or hurt her if they start behaving good towards her",
+      "category": "general",
+      "timestamp": "2026-10-02 17:35:37"
+    },
+    {
+      "fact": "she like chocolate, She also likes being alone, she likes to stay in home, she likes to listen to music, she likes marathi culture, she likes to be pampered, she likes sipping bottles, she likes stickers any that are cute, she likes to be passenger princess",
+      "category": "general",
+      "timestamp": "2026-10-02 17:43:05"
+    },
+    {
+      "fact": "Her fantasy is to be the dominent person in a realtionship",
+      "category": "general",
+      "timestamp": "2026-10-02 17:43:27"
+    },
+    {
+      "fact": "Shes allergic to Metallic Materials and also she cant handle too much chocolate",
+      "category": "general",
+      "timestamp": "2026-10-02 17:44:07"
+    },
+    {
+      "fact": "Her favourite ice cream flavour is butter scotch.",
+      "category": "general",
+      "timestamp": "2026-10-02 17:44:49"
+    },
+    {
+      "fact": "She has the most innocent smile and her eyes are soo cute than can literally melt anyone, Her voice is melody than even songs cant beat it, Her hair is one of its kind just perfect, shes smart yet clusmy and extremely cute that i cant stay mad at her no matter what, her outfits are just the best, she has amazing movie taste too and not to mention her music taste is also amazing",
+      "category": "general",
+      "timestamp": "2026-10-02 17:48:46"
+    },
+    {
+      "fact": "I love Priya with all my heart. She's the best for me; I love her too much. I see her working hard, being genuine and kind towards others, but receiving very little in return. I want to ensure she receives what she gives. I will be her Priya. I will do all that she does for others, and more. I will bethe one to make her feel loved, the one to make her the happiest, and the one to make her feel valued and respected. I will be the guy she dreams of, and more. That is my mission.",
+      "category": "general",
+      "timestamp": "2026-10-02 18:00:11"
+    },
+    {
+      "fact": "Priya is my first love, I have never felt the happiness she brings for me, She's cute,smart, kind, geniune, pretty, patient, wise, mature, confident, gentle, loyal, trustworthy, honest, sincere, caring, sweet, attractive, gorgeous, precious, fascinating, irreplaceable, Talented and more, My description stops only because i ran out of words to describe her but she is more than meets the eye.",
+      "category": "general",
+      "timestamp": "2026-10-02 18:08:35"
+    }
+  ],
+  "mission_history": [
+    {
+      "objective": "Test Objective 1",
+      "summary": "Executed memory validation successfully.",
+      "success": true,
+      "timestamp": "2026-09-19 16:09:19"
+    },
+    {
+      "objective": "Inspect the scratch directory and check if all tests ran",
+      "summary": "Objective 'Inspect the scratch directory and check if all tests ran' processed across 4 directives. All steps completed. Telemetry nominal.",
+      "success": true,
+      "timestamp": "2026-09-19 16:11:45"
+    },
+    {
+      "objective": "Test Objective 1",
+      "summary": "Executed memory validation successfully.",
+      "success": true,
+      "timestamp": "2026-09-19 17:15:12"
+    },
+    {
+      "objective": "Research: about hackathons and tell me a winning stratigy",
+      "summary": "Compiled dossier with live web telemetry.",
+      "success": true,
+      "timestamp": "2026-09-19 22:38:04"
+    },
+    {
+      "objective": "Research: on VBIT institute",
+      "summary": "Compiled dossier with live web telemetry.",
+      "success": true,
+      "timestamp": "2026-09-29 21:42:41"
+    }
+  ],
+  "last_updated": "2026-10-02T18:08:35.830485"
+}

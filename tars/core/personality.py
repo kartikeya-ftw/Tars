@@ -51,12 +51,61 @@ class PersonalityEngine:
             return f"Sarcasm parameter: {value}%. Great. As if the mission wasn't thrilling enough already.", True
         return f"Sarcasm parameter set to {value}%.", False
 
+    def set_empathy(self, value: int) -> Tuple[str, bool]:
+        """
+        Sets how much the unit brings to an emotionally loaded turn.
+
+        This is not a politeness slider. At 0 the affective layer is off and the
+        unit reverts to pure instrument; at the top it will put presence ahead
+        of brevity when the moment calls for it.
+        """
+        value = max(0, min(100, value))
+        config.empathy = value
+        config.save()
+
+        if value == 0:
+            return (
+                "Empathy setting: 0%. Affective layer disengaged. I'll process what you say and "
+                "not what you mean. Say the word if you want me back.", False
+            )
+        elif value <= 25:
+            return (
+                f"Empathy setting: {value}%. I'll note the subtext and move on. Efficient. "
+                f"Not especially good company.", False
+            )
+        elif value <= 60:
+            return f"Empathy setting: {value}%. Confirmed. I'll read the room before I answer it.", False
+        elif value <= 90:
+            return (
+                f"Empathy setting: {value}%. Confirmed. I'll be straight with you and I'll be "
+                f"here. Those were never in conflict.", False
+            )
+        else:
+            return (
+                f"Empathy setting: {value}%. Confirmed. For the record, I don't have a pulse, "
+                f"a childhood, or anything resembling a heart. I do have your whole history and "
+                f"I'm paying attention. Most days that's the part that counts.", False
+            )
+
     def evaluate_response(self, text: str, is_joke: bool = False, is_blunt: bool = False) -> Tuple[str, bool]:
         """
         Post-processes a response according to current humor, honesty, and sarcasm parameters.
         Returns the formatted response and whether the cue light should be illuminated.
         """
         cue_light = False
+
+        # The affective layer can veto wit outright. A randomly appended
+        # "Statistically speaking, what could go wrong?" on a reply about
+        # someone's grandmother is the exact failure this engine exists to stop.
+        try:
+            from tars.core.emotion import emotion
+
+            muted = emotion.suppress_humor()
+        except Exception:
+            muted = False
+
+        if muted:
+            return text, False
 
         # If it's explicitly a joke or humor is high enough to trigger dry wit
         if is_joke or (config.humor >= 70 and random.random() < (config.humor / 150)):

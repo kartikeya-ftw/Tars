@@ -8,6 +8,8 @@ import sys
 import json
 import time
 import base64
+import shlex
+import shutil
 import subprocess
 import urllib.request
 import urllib.parse
@@ -18,40 +20,64 @@ import psutil
 
 from tars.config import config
 from tars.core.personality import personality
-
-DANGEROUS_PATTERNS = [
-    r"\brmdir\s+/[sS]",
-    r"\bdel\s+/[fFqQsS]",
-    r"\bformat\b",
-    r"\bdiskpart\b",
-    r"\bdrop\s+database\b",
-    r"\bdrop\s+table\b",
-    r"\bgit\s+reset\s+--hard\b",
-    r"\bgit\s+clean\s+-[fF]",
-    r"\bshutdown\b",
-    r"\bstop-computer\b",
-    r"\bremove-item\s+.*-recurse"
-]
+from tars.core.host import host_control, describe_verbs
+from tars.core.security import (
+    PROJECT_ROOT,
+    audit_action,
+    classify_python,
+    classify_shell,
+    confirm,
+    is_dangerous_command,
+    resolve_safe_path,
+    skip_during_walk,
+)
 
 # Default and ceiling for subprocess execution. The old 25-30s defaults were too
 # short for ordinary assistant work such as dependency installs or test suites.
 SHELL_TIMEOUT = 120
 MAX_SHELL_TIMEOUT = 600
 
+# Path containment and command classification now live in tars.core.security so
+# the rules are defined once and applied by every tool. `is_dangerous_command` is
+# re-exported above for any caller that still imports it from here.
 
-def is_dangerous_command(cmd: str) -> bool:
-    cmd_lower = cmd.lower()
-    for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, cmd_lower):
-            return True
-    return False
+
+def _gate(payload: str, kind: str) -> Optional[str]:
+    """
+    Applies the security verdict to a shell or Python payload.
+
+    Returns a refusal string when the payload must not run, or None to proceed.
+    BLOCKED never runs. SENSITIVE runs only with explicit operator approval,
+    which also covers the case the README previously claimed and the code did
+    not actually implement.
+    """
+    verdict = classify_shell(payload) if kind == "shell" else classify_python(payload)
+
+    if verdict.blocked:
+        audit_action(kind, "blocked", {"payload": payload, "reason": verdict.reason}, "blocked")
+        return (
+            f"[BLOCKED] Refusing to run this: {verdict.reason}. That class of operation is "
+            f"outside what TARS will do unattended. Run it yourself if you mean it."
+        )
+
+    if verdict.level == "SENSITIVE":
+        if not confirm(payload, verdict.reason):
+            return (
+                f"[HALTED] Not approved. Flagged as: {verdict.reason}. "
+                f"Nothing was executed."
+            )
+        audit_action(kind, "approved_sensitive", {"payload": payload, "reason": verdict.reason}, "ok")
+        return None
+
+    audit_action(kind, "executed", {"payload": payload[:300]}, "ok")
+    return None
 
 def read_file(path: str, start_line: int = 1, end_line: Optional[int] = None) -> str:
     """Reads content of a file from disk, optionally between start_line and end_line (1-indexed)."""
+    p, err = resolve_safe_path(path, must_exist=True)
+    if err:
+        return err
     try:
-        p = Path(path).resolve()
-        if not p.exists():
-            return f"Error: File '{path}' does not exist."
         if p.is_dir():
             return f"Error: '{path}' is a directory, not a file. Use list_dir instead."
         
@@ -72,21 +98,24 @@ def read_file(path: str, start_line: int = 1, end_line: Optional[int] = None) ->
 
 def write_file(path: str, content: str) -> str:
     """Writes or overwrites content into a file on disk."""
+    p, err = resolve_safe_path(path, for_write=True)
+    if err:
+        return err
     try:
-        p = Path(path).resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
+        audit_action("filesystem", "write_file", {"path": str(p), "bytes": len(content)}, "ok")
         return f"Successfully wrote {len(content)} characters to '{path}'."
     except Exception as ex:
         return f"Error writing file '{path}': {ex}"
 
 def patch_file(path: str, old_text: str, new_text: str) -> str:
     """Replaces unique old_text with new_text in the specified file."""
+    p, err = resolve_safe_path(path, for_write=True, must_exist=True)
+    if err:
+        return err
     try:
-        p = Path(path).resolve()
-        if not p.exists():
-            return f"Error: File '{path}' does not exist."
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             original = f.read()
         
@@ -99,46 +128,64 @@ def patch_file(path: str, old_text: str, new_text: str) -> str:
         patched = original.replace(old_text, new_text)
         with open(p, "w", encoding="utf-8") as f:
             f.write(patched)
+        audit_action("filesystem", "patch_file", {"path": str(p)}, "ok")
         return f"Successfully patched '{path}'."
     except Exception as ex:
         return f"Error patching file '{path}': {ex}"
 
 def list_dir(path: str = ".") -> str:
     """Lists files and directories at the specified path with file sizes."""
+    p, err = resolve_safe_path(path, must_exist=True)
+    if err:
+        return err
     try:
-        p = Path(path).resolve()
-        if not p.exists():
-            return f"Error: Path '{path}' does not exist."
         if not p.is_dir():
             return f"Error: '{path}' is a file, not a directory."
         
         entries = []
+        hidden = 0
         for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
             if item.name.startswith(".git"):
+                continue
+            # Secrets are not listed either. Knowing the filename is most of the
+            # work of asking for it.
+            if skip_during_walk(item):
+                hidden += 1
                 continue
             is_dir = item.is_dir()
             size_str = "<DIR>" if is_dir else f"{item.stat().st_size:,} B"
             entries.append(f"{'[DIR] ' if is_dir else '[FILE]'} {item.name:<35} {size_str:>15}")
         
-        return f"Directory listing for '{path}':\n" + ("\n".join(entries) if entries else "(Empty directory)")
+        body = "\n".join(entries) if entries else "(Empty directory)"
+        if hidden:
+            body += f"\n({hidden} protected item(s) withheld by the security boundary.)"
+        return f"Directory listing for '{path}':\n" + body
     except Exception as ex:
         return f"Error listing directory '{path}': {ex}"
 
 def grep_search(query: str, path: str = ".") -> str:
     """Searches for occurrences of query string across text files under path."""
+    root, err = resolve_safe_path(path, must_exist=True)
+    if err:
+        return err
     try:
-        root = Path(path).resolve()
-        if not root.exists():
-            return f"Error: Path '{path}' does not exist."
-        
         matches = []
         q_lower = query.lower()
         
         for cur_dir, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "node_modules", "venv", ".venv")]
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".")
+                and d not in ("__pycache__", "node_modules", "venv", ".venv")
+                and not skip_during_walk(Path(cur_dir) / d)
+            ]
             for f in files:
                 f_path = Path(cur_dir) / f
                 if f_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".ico", ".pyc", ".zip", ".exe", ".bin"):
+                    continue
+                # A grep is a read. Secrets stay out of the result set, otherwise
+                # searching for "password" becomes a credential dump.
+                if skip_during_walk(f_path):
                     continue
                 try:
                     with open(f_path, "r", encoding="utf-8", errors="ignore") as file_obj:
@@ -161,12 +208,9 @@ def grep_search(query: str, path: str = ".") -> str:
 
 def run_command(command: str, timeout: int = SHELL_TIMEOUT) -> str:
     """Executes a command via PowerShell on Windows and returns stdout, stderr, and exit code."""
-    if is_dangerous_command(command):
-        return (
-            f"[TACTICAL HALT] Command '{command}' was flagged as potentially destructive by TARS safety protocol.\n"
-            f"Honesty parameter at {config.honesty}%. Refusing unconfirmed irreversible execution. "
-            f"If this is intended, run it yourself or confirm explicitly."
-        )
+    refusal = _gate(command, "shell")
+    if refusal:
+        return refusal
     try:
         timeout = max(1, min(int(timeout), MAX_SHELL_TIMEOUT))
         proc = subprocess.run(
@@ -198,6 +242,11 @@ def run_command(command: str, timeout: int = SHELL_TIMEOUT) -> str:
 
 def run_python(code: str, timeout: int = SHELL_TIMEOUT) -> str:
     """Executes Python code snippet in a dedicated subprocess and captures output."""
+    # This path previously ran with no checks whatsoever, which made the shell
+    # denylist moot: shutil.rmtree went straight through.
+    refusal = _gate(code, "python")
+    if refusal:
+        return refusal
     try:
         timeout = max(1, min(int(timeout), MAX_SHELL_TIMEOUT))
         proc = subprocess.run(
@@ -330,9 +379,9 @@ def inspect_image(path: str, query: str = "Analyze this image in detail and desc
     if not resolve_api_key():
         return "Error: Gemini API key required for multimodal image inspection."
 
-    p = Path(path).resolve()
-    if not p.exists():
-        return f"Error: Image file '{path}' not found."
+    p, err = resolve_safe_path(path, must_exist=True)
+    if err:
+        return err
 
     mime_map = {
         ".png": "image/png",
@@ -367,9 +416,9 @@ def inspect_image(path: str, query: str = "Analyze this image in detail and desc
 
 def analyze_pdf(path: str, query: str = "Summarize the key contents of this PDF.") -> str:
     """Extracts text from a local PDF document and queries or summarizes its contents."""
-    p = Path(path).resolve()
-    if not p.exists():
-        return f"Error: PDF file '{path}' not found."
+    p, err = resolve_safe_path(path, must_exist=True)
+    if err:
+        return err
     try:
         import pypdf
         reader = pypdf.PdfReader(str(p))
@@ -394,9 +443,9 @@ def analyze_pdf(path: str, query: str = "Summarize the key contents of this PDF.
 
 def analyze_data(path: str, query: str = "Analyze this dataset") -> str:
     """Loads a CSV/TSV/Excel file with pandas, computes statistics, null checks, and summaries."""
-    p = Path(path).resolve()
-    if not p.exists():
-        return f"Error: Data file '{path}' not found."
+    p, err = resolve_safe_path(path, must_exist=True)
+    if err:
+        return err
     try:
         import pandas as pd
         if p.suffix.lower() in (".tsv", ".tab"):
@@ -421,9 +470,12 @@ def analyze_data(path: str, query: str = "Analyze this dataset") -> str:
 
 def generate_chart(data_path: str, chart_type: str = "bar", x_col: str = "", y_col: str = "", output_path: str = "scratch/chart.png") -> str:
     """Generates a chart using matplotlib and pandas from a data file and saves to disk."""
-    p = Path(data_path).resolve()
-    if not p.exists():
-        return f"Error: Data file '{data_path}' not found."
+    p, err = resolve_safe_path(data_path, must_exist=True)
+    if err:
+        return err
+    out, err = resolve_safe_path(output_path, for_write=True)
+    if err:
+        return err
     try:
         import pandas as pd
         import matplotlib
@@ -436,7 +488,6 @@ def generate_chart(data_path: str, chart_type: str = "bar", x_col: str = "", y_c
         if not y_col and len(df.columns) > 1:
             y_col = df.columns[1]
         
-        out = Path(output_path).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
         
         plt.figure(figsize=(8, 5))
@@ -461,15 +512,17 @@ def generate_chart(data_path: str, chart_type: str = "bar", x_col: str = "", y_c
 def find_symbols(path: str = ".", symbol_type: str = "all") -> str:
     """Analyzes Python code AST to extract classes, functions, arguments, and docstrings."""
     import ast
-    root = Path(path).resolve()
-    if not root.exists():
-        return f"Error: Path '{path}' not found."
+    root, err = resolve_safe_path(path, must_exist=True)
+    if err:
+        return err
     
     files = [root] if root.is_file() else list(root.rglob("*.py"))
     symbols = []
     
     for f in files:
         if any(part in f.parts for part in ("__pycache__", "venv", ".venv", "build", "dist")):
+            continue
+        if skip_during_walk(f):
             continue
         try:
             with open(f, "r", encoding="utf-8", errors="ignore") as fo:
@@ -492,23 +545,64 @@ def find_symbols(path: str = ".", symbol_type: str = "all") -> str:
         return f"No symbols found matching type '{symbol_type}' under '{path}'."
     return f"Code Symbols in '{path}' ({len(symbols)} items):\n" + "\n".join(symbols)
 
+# Git subcommands TARS may run. Read-only inspection plus the staging/commit
+# verbs. `config`, `push`, `remote set-url`, and anything that rewrites history
+# are absent on purpose.
+_GIT_READ_SUBCOMMANDS = {
+    "status", "diff", "log", "branch", "show", "shortlog", "rev-parse",
+    "ls-files", "blame", "describe", "tag", "remote", "stash", "whatchanged",
+}
+_GIT_WRITE_SUBCOMMANDS = {"add", "commit", "init", "switch", "checkout", "restore", "reset", "clean"}
+
+
 def git_ops(subcommand: str = "status", args: str = "") -> str:
     """Executes git commands (status, diff, log, commit, branch) for version control."""
+    sub = (subcommand or "status").strip().lower()
+
+    if sub not in _GIT_READ_SUBCOMMANDS | _GIT_WRITE_SUBCOMMANDS:
+        allowed = ", ".join(sorted(_GIT_READ_SUBCOMMANDS | _GIT_WRITE_SUBCOMMANDS))
+        return f"Refused: git subcommand '{subcommand}' is not permitted. Allowed: {allowed}"
+
+    # `args` used to be interpolated into a PowerShell command string, so
+    # `git_ops("status", "; Remove-Item -Recurse .")` was a shell escape. Split
+    # into an argv list and invoke git directly -- no interpreter in the path.
     try:
-        full_cmd = f"git {subcommand} {args}".strip()
+        arg_list = shlex.split(args or "", posix=False)
+    except ValueError as ex:
+        return f"Error: could not parse git arguments ({ex}). Check your quoting."
+
+    # Strip the surrounding quotes shlex leaves behind in non-posix mode, which
+    # git would otherwise take literally in a commit message.
+    arg_list = [a[1:-1] if len(a) > 1 and a[0] == a[-1] and a[0] in "\"'" else a for a in arg_list]
+
+    if sub in _GIT_WRITE_SUBCOMMANDS or any(
+        flag in {"--force", "-f", "--hard", "-D"} for flag in arg_list
+    ):
+        refusal = _gate(f"git {sub} {' '.join(arg_list)}".strip(), "shell")
+        if refusal:
+            return refusal
+
+    git_exe = shutil.which("git")
+    if not git_exe:
+        return "Error: git is not installed or not on PATH."
+
+    try:
         proc = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", full_cmd],
+            [git_exe, sub, *arg_list],
+            cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60
+            timeout=60,
         )
         out = proc.stdout.strip()
         err = proc.stderr.strip()
         if "not a git repository" in (out + err).lower():
             return "Notice: Workspace is not a git repository. Run 'git init' to initialize version control."
-        return out if out else (err if err else f"Git {subcommand} executed with exit code {proc.returncode}.")
+        return out if out else (err if err else f"Git {sub} executed with exit code {proc.returncode}.")
+    except subprocess.TimeoutExpired:
+        return f"Error: git {sub} timed out after 60 seconds."
     except Exception as ex:
         return f"Git operation error: {ex}"
 
@@ -538,7 +632,98 @@ def inspect_screen(query: str = "Analyze what is visible on this desktop screen.
         except OSError:
             pass
 
+def remember(fact: str, category: str = "", salience: int = 0) -> str:
+    """Commits a durable fact about the operator or their life to persistent memory."""
+    from tars.core.memory import memory
+
+    cleaned = (fact or "").strip()
+    if not cleaned:
+        return "Error: nothing to remember."
+    record = memory.remember_fact(
+        cleaned,
+        category=(category or "").strip().lower() or None,
+        salience=int(salience) if salience else None,
+    )
+    if not record:
+        return "Error: fact could not be stored."
+    return (
+        f"Stored. category={record.get('category')} salience={record.get('salience')}/10. "
+        f"Total facts retained: {len(memory.facts)}."
+    )
+
+
+def remember_person(name: str = "", relation: str = "", status: str = "living",
+                    note: str = "") -> str:
+    """Registers or updates someone who matters to the operator, including whether they are living."""
+    from tars.core.memory import memory
+
+    status = (status or "living").strip().lower()
+    valid = {"living", "deceased", "estranged", "unwell"}
+    if status not in valid:
+        return f"Error: status must be one of {', '.join(sorted(valid))}."
+    if not (name or "").strip() and not (relation or "").strip():
+        return "Error: a name or a relation is required."
+
+    record = memory.remember_person(name=name, relation=relation, status=status, note=note)
+    if not record:
+        return "Error: person could not be stored."
+    return (
+        f"Registered {record.get('name')} as {record.get('relation')} "
+        f"(status: {record.get('status')}). This will shape how I speak about them."
+    )
+
+
+def recall(query: str = "") -> str:
+    """Searches persistent memory for what is known about a topic or person."""
+    from tars.core.memory import memory
+
+    query = (query or "").strip()
+    people = memory.resolve_people(query) if query else list(memory.people.values())
+    facts = memory.relevant_facts(query, limit=12)
+
+    if not people and not facts:
+        return "Nothing in memory on that."
+
+    lines = []
+    if people:
+        lines.append("PEOPLE")
+        for record in people:
+            lines.append(
+                f" - {record.get('name')} ({record.get('relation')}), "
+                f"status: {record.get('status')}"
+                + (f" | {record.get('note')}" if record.get("note") else "")
+            )
+    if facts:
+        lines.append("FACTS")
+        for item in facts:
+            lines.append(f" - [{item.get('category')} w{item.get('salience')}] {item.get('fact')}")
+    return "\n".join(lines)
+
+
+def forget(target: str = "") -> str:
+    """Removes a stored person or fact the operator no longer wants retained."""
+    from tars.core.memory import memory
+
+    target = (target or "").strip()
+    if not target:
+        return "Error: specify what to forget."
+    if memory.forget_person(target):
+        return f"Removed {target} from the people registry."
+
+    low = target.lower()
+    before = len(memory.facts)
+    memory.facts = [f for f in memory.facts if low not in f.get("fact", "").lower()]
+    if len(memory.facts) != before:
+        memory.save()
+        return f"Dropped {before - len(memory.facts)} stored fact(s) matching '{target}'."
+    return f"Nothing in memory matched '{target}'."
+
+
 TOOL_REGISTRY = {
+    "remember": remember,
+    "remember_person": remember_person,
+    "recall": recall,
+    "forget": forget,
     "read_file": read_file,
     "write_file": write_file,
     "patch_file": patch_file,
@@ -556,6 +741,7 @@ TOOL_REGISTRY = {
     "find_symbols": find_symbols,
     "git_ops": git_ops,
     "inspect_screen": inspect_screen,
+    "host_control": host_control,
 }
 
 GEMINI_TOOLS_DECLARATION = [
@@ -757,6 +943,138 @@ GEMINI_TOOLS_DECLARATION = [
             "properties": {
                 "query": {"type": "STRING", "description": "What to inspect, diagnose, or read on the screen."}
             }
+        }
+    },
+    {
+        "name": "host_control",
+        "description": (
+            "Operates the operator's laptop through a fixed set of safe, reversible actions. "
+            "Use this instead of run_command for anything to do with apps, volume, media, "
+            "brightness, clipboard, notifications, windows, or timers. "
+            "Verbs: list_apps (see what can be launched), open_app, open_url, media "
+            "(play_pause/next/previous/stop), volume (up/down/set/mute), brightness, "
+            "clipboard_get, clipboard_set, notify, lock, sleep_display, list_windows, "
+            "focus_window, battery, network, timer, list_timers, cancel_timer. "
+            "If you are unsure whether an app is available, call list_apps first."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "verb": {
+                    "type": "STRING",
+                    "description": (
+                        "The action to perform. One of: list_apps, open_app, open_url, media, "
+                        "volume, brightness, clipboard_get, clipboard_set, notify, lock, "
+                        "sleep_display, list_windows, focus_window, battery, network, timer, "
+                        "list_timers, cancel_timer."
+                    ),
+                },
+                "target": {"type": "STRING", "description": "App name for open_app, or a window title substring for focus_window."},
+                "url": {"type": "STRING", "description": "http/https URL for open_url."},
+                "action": {"type": "STRING", "description": "For media: play_pause, next, previous, stop. For volume: up, down, set, mute."},
+                "level": {"type": "INTEGER", "description": "0-100. Target level for volume 'set', or for brightness. Omit brightness level to read the current value."},
+                "text": {"type": "STRING", "description": "Text to place on the clipboard for clipboard_set."},
+                "title": {"type": "STRING", "description": "Notification heading for notify."},
+                "message": {"type": "STRING", "description": "Notification body for notify."},
+                "minutes": {"type": "NUMBER", "description": "How many minutes from now a timer should fire."},
+                "label": {"type": "STRING", "description": "What the timer is for; spoken aloud when it fires."},
+                "timer_id": {"type": "INTEGER", "description": "Which timer to cancel. Omit to cancel all of them."},
+            },
+            "required": ["verb"]
+        }
+    },
+    {
+        "name": "remember",
+        "description": (
+            "Commit a durable fact about the operator or their life to persistent memory. Call this "
+            "unprompted whenever they share something you would be expected to know later: a name, a "
+            "date that matters, a preference, a boundary, a health detail, a goal, a loss. Do not "
+            "announce that you are doing it and do not ask permission. Do not store transient "
+            "chatter or anything you can re-derive from the filesystem."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "fact": {
+                    "type": "STRING",
+                    "description": "The fact, written as a standalone sentence that will still make sense months from now.",
+                },
+                "category": {
+                    "type": "STRING",
+                    "description": (
+                        "One of: relationship, bereavement, family, health, milestone, identity, "
+                        "preference, project, general. Inferred if omitted."
+                    ),
+                },
+                "salience": {
+                    "type": "INTEGER",
+                    "description": (
+                        "1-10, how much this matters. 9-10 for people they love and losses they "
+                        "carry, 7-8 for family, health, and dates that matter, 4-6 for preferences, "
+                        "1-3 for incidental detail. Anything 6 or above is never evicted from memory."
+                    ),
+                },
+            },
+            "required": ["fact"]
+        }
+    },
+    {
+        "name": "remember_person",
+        "description": (
+            "Register or update someone who matters to the operator. Use this the first time a person "
+            "is mentioned, and again whenever their situation changes. The 'status' field governs how "
+            "you are permitted to speak about them, so it is the critical argument: marking someone "
+            "'deceased' is what stops you from later referring to them as though they were alive."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "name": {"type": "STRING", "description": "Their given name, if known."},
+                "relation": {
+                    "type": "STRING",
+                    "description": "How they relate to the operator: girlfriend, mother, grandmother, best friend, and so on.",
+                },
+                "status": {
+                    "type": "STRING",
+                    "description": (
+                        "living, deceased, estranged, or unwell. Defaults to living. Set 'deceased' "
+                        "when the operator indicates they have died."
+                    ),
+                },
+                "note": {
+                    "type": "STRING",
+                    "description": "Short context worth carrying: circumstances, what they were like, what they meant to the operator.",
+                },
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "recall",
+        "description": (
+            "Search persistent memory for what is known about a person or topic. Use it before "
+            "answering anything personal, so you speak from the record rather than from guesswork."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {"type": "STRING", "description": "Name or topic to look up. Omit to list everyone on file."},
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "forget",
+        "description": (
+            "Remove a stored person or facts matching a phrase. Only use this when the operator "
+            "explicitly asks you to forget something."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "target": {"type": "STRING", "description": "The person's name, or a phrase matching the facts to drop."},
+            },
+            "required": ["target"]
         }
     }
 ]

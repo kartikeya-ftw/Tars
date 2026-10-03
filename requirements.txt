@@ -18,3 +18,7 @@ matplotlib>=3.7.0
 
 # Computer vision (inspect_image, inspect_screen)
 pillow>=10.0.0
+
+# Neural speech synthesis (tars/ui/voice.py). Optional: without it TARS falls
+# back to the Windows SAPI voice, which still works but sounds like 2010.
+edge-tts>=6.1.9
